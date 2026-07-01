@@ -16,6 +16,9 @@ Matched method and parameters:
 - length scales available from the paper: `l0 = 1.5e-2 mm` (default) and `7.5e-3 mm`
 - generated mesh size is constrained by `h <= 0.5 l0` so the diffuse crack band is resolved
 - paper loading rule: `Delta u = 1e-5 mm` for the first 450 steps, then `1e-6 mm`
+- the run stops by default once the monitored crack reaches the right boundary
+- reaction force and energy are sampled every 5 steps by default to reduce post-processing cost
+- Matplotlib step plots are saved every 5 steps by default
 
 Run a quick validation in the PINN environment:
 
@@ -63,11 +66,13 @@ Show the first 10 tensile loading steps:
 For long runs, save one image every 10 loading steps:
 
 ```powershell
-& 'D:\APP\PINN\Scripts\python.exe' .\phase_field_zhou_tension.py --full --step-plot-every 10 --output-dir .\results_full
+& 'D:\APP\PINN\Scripts\python.exe' .\phase_field_zhou_tension.py --full --step-plot-every 10 --postprocess-every 10 --output-dir .\results_full
 ```
 
 Load directly to `6e-3 mm` with uniformly spaced display steps:
 
 ```powershell
-& 'D:\APP\PINN\Scripts\python.exe' .\phase_field_zhou_tension.py --final-displacement 6e-3 --uniform-steps 120 --step-plot-every 10 --stop-on-through --output-dir .\results_u6e-3
+& 'D:\APP\PINN\Scripts\python.exe' .\phase_field_zhou_tension.py --final-displacement 6e-3 --uniform-steps 120 --step-plot-every 10 --postprocess-every 10 --output-dir .\results_u6e-3
 ```
+
+To continue loading after a through-crack, add `--continue-after-through`.

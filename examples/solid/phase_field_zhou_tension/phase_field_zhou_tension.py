@@ -18,6 +18,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -36,6 +37,8 @@ sys.path.insert(0, str(TENSORMESH_ROOT))
 from tensormesh import Mesh
 from tensormesh.assemble import ElementAssembler
 from tensormesh.dataset.mesh import gen_rectangle
+from tensormesh.element import element_type2element, element_type2order
+from tensormesh.sparse import spsolve
 
 
 # Paper units are mm, N, and N/mm^2.
@@ -298,6 +301,171 @@ def max_history(
     return {key: torch.maximum(old_history[key], new_history[key]) for key in old_history}
 
 
+def coalesce_coo(
+    row: torch.Tensor,
+    col: torch.Tensor,
+    values: torch.Tensor,
+    shape: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = row * shape[1] + col
+    unique_flat, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+    unique_values = torch.zeros(unique_flat.shape[0], dtype=values.dtype, device=values.device)
+    unique_values.index_add_(0, inverse, values)
+    unique_row = torch.div(unique_flat, shape[1], rounding_mode="floor")
+    unique_col = unique_flat - unique_row * shape[1]
+    return unique_row.long(), unique_col.long(), unique_values
+
+
+def structured_grid_laplacian(
+    points: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    x_values = torch.sort(torch.unique(points[:, 0].detach())).values
+    y_values = torch.sort(torch.unique(points[:, 1].detach())).values
+    nx = int(x_values.numel())
+    ny = int(y_values.numel())
+    n_points = int(points.shape[0])
+    if nx * ny != n_points or nx < 2 or ny < 2:
+        return None
+
+    lookup = {
+        (round(float(points[i, 0].detach().cpu()), 12), round(float(points[i, 1].detach().cpu()), 12)): i
+        for i in range(n_points)
+    }
+    grid = torch.empty((ny, nx), dtype=torch.long, device=points.device)
+    for iy, y in enumerate(y_values.detach().cpu().tolist()):
+        for ix, x in enumerate(x_values.detach().cpu().tolist()):
+            index = lookup.get((round(float(x), 12), round(float(y), 12)))
+            if index is None:
+                return None
+            grid[iy, ix] = index
+
+    rows: list[int] = []
+    cols: list[int] = []
+    vals: list[float] = []
+
+    def add(row_idx: int, col_idx: int, value: float) -> None:
+        rows.append(row_idx)
+        cols.append(col_idx)
+        vals.append(value)
+
+    x_cpu = x_values.detach().cpu()
+    y_cpu = y_values.detach().cpu()
+    grid_cpu = grid.detach().cpu()
+    for iy in range(ny):
+        for ix in range(nx):
+            center = int(grid_cpu[iy, ix])
+            diag = 0.0
+
+            if ix == 0:
+                coeff = 2.0 / float((x_cpu[1] - x_cpu[0]) ** 2)
+                add(center, int(grid_cpu[iy, ix + 1]), coeff)
+                diag -= coeff
+            elif ix == nx - 1:
+                coeff = 2.0 / float((x_cpu[-1] - x_cpu[-2]) ** 2)
+                add(center, int(grid_cpu[iy, ix - 1]), coeff)
+                diag -= coeff
+            else:
+                h_left = float(x_cpu[ix] - x_cpu[ix - 1])
+                h_right = float(x_cpu[ix + 1] - x_cpu[ix])
+                left_coeff = 2.0 / (h_left * (h_left + h_right))
+                right_coeff = 2.0 / (h_right * (h_left + h_right))
+                add(center, int(grid_cpu[iy, ix - 1]), left_coeff)
+                add(center, int(grid_cpu[iy, ix + 1]), right_coeff)
+                diag -= left_coeff + right_coeff
+
+            if iy == 0:
+                coeff = 2.0 / float((y_cpu[1] - y_cpu[0]) ** 2)
+                add(center, int(grid_cpu[iy + 1, ix]), coeff)
+                diag -= coeff
+            elif iy == ny - 1:
+                coeff = 2.0 / float((y_cpu[-1] - y_cpu[-2]) ** 2)
+                add(center, int(grid_cpu[iy - 1, ix]), coeff)
+                diag -= coeff
+            else:
+                h_down = float(y_cpu[iy] - y_cpu[iy - 1])
+                h_up = float(y_cpu[iy + 1] - y_cpu[iy])
+                down_coeff = 2.0 / (h_down * (h_down + h_up))
+                up_coeff = 2.0 / (h_up * (h_down + h_up))
+                add(center, int(grid_cpu[iy - 1, ix]), down_coeff)
+                add(center, int(grid_cpu[iy + 1, ix]), up_coeff)
+                diag -= down_coeff + up_coeff
+
+            add(center, center, diag)
+
+    row = torch.as_tensor(rows, dtype=torch.long, device=points.device)
+    col = torch.as_tensor(cols, dtype=torch.long, device=points.device)
+    values = torch.as_tensor(vals, dtype=points.dtype, device=points.device)
+    return coalesce_coo(row, col, values, (n_points, n_points))
+
+
+def mesh_edge_pairs(mesh: Mesh) -> torch.Tensor:
+    all_pairs = []
+    elements_by_type = mesh.elements(-1)
+    for element_type, elements in elements_by_type.items():
+        element = element_type2element(element_type)
+        order = element_type2order[element_type]
+        facets = element.get_facet(order)
+        if isinstance(facets, tuple):
+            facets = torch.cat([facet for facet in facets if facet.shape[-1] >= 2], dim=0)
+        local_pairs = []
+        for facet in facets:
+            local_pairs.append(torch.stack((facet[:-1], facet[1:]), dim=-1))
+        if not local_pairs:
+            continue
+        local_pairs_tensor = torch.cat(local_pairs, dim=0).to(device=elements.device)
+        pairs = elements[:, local_pairs_tensor].reshape(-1, 2)
+        all_pairs.append(pairs)
+
+    if not all_pairs:
+        raise RuntimeError("Could not build phase-field graph Laplacian because the mesh has no edges.")
+    pairs = torch.cat(all_pairs, dim=0)
+    pairs = torch.cat((pairs, pairs.flip(dims=(1,))), dim=0)
+    return torch.unique(pairs, sorted=True, dim=0)
+
+
+def graph_laplacian(mesh: Mesh) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    edges = mesh_edge_pairs(mesh)
+    row = edges[:, 0]
+    col = edges[:, 1]
+    distance_sq = ((mesh.points[row] - mesh.points[col]) ** 2).sum(dim=-1)
+    keep = distance_sq > torch.finfo(mesh.points.dtype).eps
+    row = row[keep]
+    col = col[keep]
+    weights = 1.0 / distance_sq[keep]
+
+    diag = torch.zeros(mesh.n_points, dtype=mesh.points.dtype, device=mesh.points.device)
+    diag.index_add_(0, row, -weights)
+    diag_index = torch.arange(mesh.n_points, dtype=torch.long, device=mesh.points.device)
+    lap_row = torch.cat((row, diag_index))
+    lap_col = torch.cat((col, diag_index))
+    lap_values = torch.cat((weights, diag))
+    return coalesce_coo(lap_row, lap_col, lap_values, (mesh.n_points, mesh.n_points))
+
+
+def build_phase_laplacian(mesh: Mesh) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
+    structured = structured_grid_laplacian(mesh.points)
+    if structured is not None:
+        row, col, values = structured
+        return row, col, values, "structured_finite_difference_neumann"
+    row, col, values = graph_laplacian(mesh)
+    return row, col, values, "edge_graph_laplacian"
+
+
+def history_at_nodes(model: ZhouTensionPhaseFieldModel, history: dict[str, torch.Tensor]) -> torch.Tensor:
+    points = next(iter(model.transformation.values())).points
+    numerator = torch.zeros(points.shape[0], dtype=points.dtype, device=points.device)
+    denominator = torch.zeros_like(numerator)
+
+    for element_type in model.element_types:
+        elements = model.elements[element_type]
+        element_history = history[element_type].mean(dim=1)
+        expanded_history = element_history[:, None].expand_as(elements).reshape(-1)
+        numerator.index_add_(0, elements.reshape(-1), expanded_history)
+        denominator.index_add_(0, elements.reshape(-1), torch.ones_like(expanded_history))
+
+    return numerator / torch.clamp(denominator, min=1.0)
+
+
 def model_energy(
     model: ZhouTensionPhaseFieldModel,
     displacement: torch.Tensor,
@@ -311,18 +479,78 @@ def fracture_energy(model: ZhouTensionPhaseFieldModel, phase: torch.Tensor, batc
     return model.energy(point_data={"phase": phase}, func=model.fracture_density, batch_size=batch_size)
 
 
-def phase_energy(
+def solve_solid_mechanics_step(
+    model: ZhouTensionPhaseFieldModel,
+    displacement: torch.Tensor,
+    phase: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    prescribed_u: float,
+    fix_side_x: bool,
+    u_iters: int,
+    batch_size: int,
+) -> None:
+    """Solve the displacement field with the phase field fixed."""
+    phase_fixed = phase.detach()
+    optimizer = optim.LBFGS(
+        [displacement],
+        lr=1.0,
+        max_iter=u_iters,
+        max_eval=max(u_iters + 4, u_iters),
+        history_size=20,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure():
+        optimizer.zero_grad()
+        u_active = apply_tension_bc(displacement, masks, prescribed_u, fix_side_x)
+        loss = model_energy(model, u_active, phase_fixed, batch_size)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    with torch.no_grad():
+        u_active = apply_tension_bc(displacement, masks, prescribed_u, fix_side_x)
+        displacement.copy_(u_active)
+
+
+def solve_phase_field_step(
     model: ZhouTensionPhaseFieldModel,
     phase: torch.Tensor,
     history: dict[str, torch.Tensor],
-    batch_size: int,
-) -> torch.Tensor:
-    return model.energy(
-        point_data={"phase": phase},
-        element_data={"history": history},
-        func=model.phase_history_density,
-        batch_size=batch_size,
+    previous_phase: torch.Tensor,
+    laplace_row: torch.Tensor,
+    laplace_col: torch.Tensor,
+    laplace_values: torch.Tensor,
+) -> None:
+    """Solve the strong-form AT2 phase-field equation with fixed history."""
+    h_node = history_at_nodes(model, history).detach()
+    n_points = phase.shape[0]
+    diag_index = torch.arange(n_points, dtype=torch.long, device=phase.device)
+    reaction_diag = model.Gc / model.l0 + 2.0 * (1.0 - model.k) * h_node
+    rhs = 2.0 * (1.0 - model.k) * h_node
+
+    row = torch.cat((laplace_row, diag_index))
+    col = torch.cat((laplace_col, diag_index))
+    values = torch.cat((-model.Gc * model.l0 * laplace_values, reaction_diag))
+    row, col, values = coalesce_coo(row, col, values, (n_points, n_points))
+    phi_new = spsolve(
+        values,
+        row,
+        col,
+        (n_points, n_points),
+        rhs,
+        method="cg",
+        preconditioner="jacobi",
+        tol=1.0e-10,
+        max_iter=20000,
+        is_spd=True,
     )
+
+    with torch.no_grad():
+        phase.copy_(phi_new.reshape_as(phase))
+        phase.clamp_(0.0, 1.0)
+        phase.copy_(torch.maximum(phase, previous_phase))
 
 
 def compute_reaction(
@@ -422,7 +650,8 @@ def save_loading_overview(mesh: Mesh, snapshots: list[dict], output_file: Path) 
     for col, snap in enumerate(snapshots):
         phase = snap["phase"]
         disp_norm = snap["disp_norm"]
-        label = f"step {snap['step']}\nu={snap['prescribed']:.1e} mm\nR={snap['reaction']:.2e}"
+        reaction_label = f"{snap['reaction']:.2e}" if math.isfinite(snap["reaction"]) else "not sampled"
+        label = f"step {snap['step']}\nu={snap['prescribed']:.1e} mm\nR={reaction_label}"
 
         im_phase = axes[0, col].tripcolor(tri, phase, shading="gouraud", cmap="magma", vmin=0.0, vmax=1.0)
         axes[0, col].plot([0.0, 0.5], [0.5, 0.5], "c-", linewidth=1.0)
@@ -450,18 +679,21 @@ def write_csv(rows: list[dict[str, float]], output_file: Path) -> None:
 
 
 def save_load_curve(rows: list[dict[str, float]], output_file: Path) -> None:
-    x = [row["prescribed_displacement_mm"] for row in rows]
-    y = [row["reaction_y_N_per_thickness"] for row in rows]
+    sampled = [row for row in rows if math.isfinite(row["reaction_y_N_per_thickness"])]
+    x = [row["prescribed_displacement_mm"] for row in sampled]
+    y = [row["reaction_y_N_per_thickness"] for row in sampled]
+    x_tip = [row["prescribed_displacement_mm"] for row in rows]
     tip = [row["crack_tip_x_mm"] for row in rows]
 
     fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.2), constrained_layout=True)
-    axes[0].plot(x, y, marker="o", markersize=2.5, linewidth=1.4)
+    if x:
+        axes[0].plot(x, y, marker="o", markersize=2.5, linewidth=1.4)
     axes[0].set_xlabel("prescribed displacement [mm]")
     axes[0].set_ylabel("reaction force [N per thickness]")
     axes[0].set_title("load-displacement response")
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(x, tip, marker="o", markersize=2.5, linewidth=1.4, color="tab:red")
+    axes[1].plot(x_tip, tip, marker="o", markersize=2.5, linewidth=1.4, color="tab:red")
     axes[1].axhline(GEOMETRY["right"], color="0.3", linestyle="--", linewidth=1.0)
     axes[1].set_xlabel("prescribed displacement [mm]")
     axes[1].set_ylabel("crack tip x [mm]")
@@ -518,6 +750,7 @@ def run(args: argparse.Namespace) -> dict:
         l0=args.length_scale,
         k=MATERIAL["k"],
     )
+    phase_laplace_row, phase_laplace_col, phase_laplace_values, phase_laplacian_scheme = build_phase_laplacian(mesh)
 
     displacement = torch.zeros((mesh.n_points, 2), dtype=dtype, device=device, requires_grad=True)
     phase = initial_phase_from_points(mesh.points, MATERIAL["Gc"], args.length_scale, PAPER_NUMERICS["B"], MATERIAL["k"])
@@ -541,61 +774,40 @@ def run(args: argparse.Namespace) -> dict:
     min_phase_increment = float("inf")
 
     previous_phase = phase.detach().clone()
+    run_start = time.perf_counter()
 
     for step, prescribed in enumerate(displacements, start=1):
-        for stagger in range(1, args.max_stagger_iters + 1):
+        step_start = time.perf_counter()
+        for split_iter in range(1, args.max_stagger_iters + 1):
             u_old = apply_tension_bc(displacement, masks, prescribed, args.fix_side_x).detach()
             phi_old = phase.detach().clone()
 
-            phase_fixed = phase.detach()
-            u_optimizer = optim.LBFGS(
-                [displacement],
-                lr=1.0,
-                max_iter=args.u_iters,
-                max_eval=max(args.u_iters + 4, args.u_iters),
-                history_size=20,
-                line_search_fn="strong_wolfe",
+            solve_solid_mechanics_step(
+                model,
+                displacement,
+                phase,
+                masks,
+                prescribed,
+                args.fix_side_x,
+                args.u_iters,
+                args.batch_size,
             )
-
-            def u_closure():
-                u_optimizer.zero_grad()
-                u_active = apply_tension_bc(displacement, masks, prescribed, args.fix_side_x)
-                loss = model_energy(model, u_active, phase_fixed, args.batch_size)
-                loss.backward()
-                return loss
-
-            u_optimizer.step(u_closure)
-
-            with torch.no_grad():
-                u_active = apply_tension_bc(displacement, masks, prescribed, args.fix_side_x)
-                displacement.copy_(u_active)
 
             history = max_history(history, tensile_energy_at_quadrature(model, displacement.detach()))
 
-            phase_optimizer = optim.LBFGS(
-                [phase],
-                lr=1.0,
-                max_iter=args.phase_iters,
-                max_eval=max(args.phase_iters + 4, args.phase_iters),
-                history_size=20,
-                line_search_fn="strong_wolfe",
+            solve_phase_field_step(
+                model,
+                phase,
+                history,
+                previous_phase,
+                phase_laplace_row,
+                phase_laplace_col,
+                phase_laplace_values,
             )
-
-            def phase_closure():
-                phase_optimizer.zero_grad()
-                loss = phase_energy(model, phase, history, args.batch_size)
-                loss.backward()
-                return loss
-
-            phase_optimizer.step(phase_closure)
-
-            with torch.no_grad():
-                phase.clamp_(0.0, 1.0)
-                phase.copy_(torch.maximum(phase, previous_phase))
 
             du = relative_change(apply_tension_bc(displacement, masks, prescribed, args.fix_side_x).detach(), u_old)
             dphi = relative_change(phase.detach(), phi_old)
-            if max(du, dphi) < args.tolerance:
+            if args.max_stagger_iters > 1 and max(du, dphi) < args.tolerance:
                 break
 
         with torch.no_grad():
@@ -612,10 +824,6 @@ def run(args: argparse.Namespace) -> dict:
             max_top_ux_error = max(max_top_ux_error, top_ux_error)
             max_bottom_error = max(max_bottom_error, bottom_error)
 
-        total = float(model_energy(model, displacement.detach(), phase.detach(), args.batch_size).detach().cpu())
-        dissipated = float(fracture_energy(model, phase.detach(), args.batch_size).detach().cpu())
-        elastic = total
-        reaction = compute_reaction(model, displacement.detach(), phase.detach(), masks["top"], args.batch_size)
         crack = crack_metrics(
             mesh,
             phase.detach(),
@@ -623,6 +831,24 @@ def run(args: argparse.Namespace) -> dict:
             band=args.crack_band,
             through_tol=args.through_tol,
         )
+        should_postprocess = (
+            step == 1
+            or step == len(displacements)
+            or step % args.postprocess_every == 0
+            or bool(crack["is_through"])
+        )
+        if should_postprocess:
+            total = float(model_energy(model, displacement.detach(), phase.detach(), args.batch_size).detach().cpu())
+            dissipated = float(fracture_energy(model, phase.detach(), args.batch_size).detach().cpu())
+            elastic = total
+            reaction = compute_reaction(model, displacement.detach(), phase.detach(), masks["top"], args.batch_size)
+        else:
+            elastic = math.nan
+            dissipated = math.nan
+            total = math.nan
+            reaction = math.nan
+        step_elapsed = time.perf_counter() - step_start
+        total_elapsed = time.perf_counter() - run_start
 
         rows.append(
             {
@@ -636,6 +862,8 @@ def run(args: argparse.Namespace) -> dict:
                 "mean_phase": float(phase.detach().mean().cpu()),
                 "crack_tip_x_mm": float(crack["crack_tip_x_mm"]),
                 "crack_length_mm": float(crack["crack_length_mm"]),
+                "step_elapsed_s": step_elapsed,
+                "total_elapsed_s": total_elapsed,
                 "is_developed": float(crack["is_developed"]),
                 "is_through": float(crack["is_through"]),
             }
@@ -644,7 +872,8 @@ def run(args: argparse.Namespace) -> dict:
         if args.save_step_plots and step % args.step_plot_every == 0:
             step_dir = Path(args.output_dir) / "steps"
             step_file = step_dir / f"step_{step:04d}.png"
-            title = f"step {step}, u={prescribed:.6e} mm, R_y={reaction:.3e}"
+            reaction_label = f"{reaction:.3e}" if math.isfinite(reaction) else "not sampled"
+            title = f"step {step}, u={prescribed:.6e} mm, R_y={reaction_label}"
             save_phase_plot(mesh, phase.detach(), displacement.detach(), step_file, title_suffix=title)
             if len(step_snapshots) < args.max_overview_steps:
                 disp_cpu = displacement.detach().cpu()
@@ -658,13 +887,18 @@ def run(args: argparse.Namespace) -> dict:
                     }
                 )
 
+        reaction_log = f"{reaction:.6e}" if math.isfinite(reaction) else "not sampled"
         print(
             f"Step {step:04d}/{len(displacements)} "
             f"u={prescribed:.6e} mm "
-            f"R_y={reaction:.6e} "
+            f"R_y={reaction_log} "
             f"phi_max={rows[-1]['max_phase']:.4f} "
             f"tip_x={rows[-1]['crack_tip_x_mm']:.4f} "
-            f"through={bool(crack['is_through'])}"
+            f"crack_length={rows[-1]['crack_length_mm']:.4f} mm "
+            f"step_time={step_elapsed:.3f} s "
+            f"total_time={total_elapsed:.1f} s "
+            f"through={bool(crack['is_through'])}",
+            flush=True,
         )
 
         if args.stop_on_through and crack["is_through"]:
@@ -693,7 +927,7 @@ def run(args: argparse.Namespace) -> dict:
         "reference": {
             "paper": "Zhou S, Rabczuk T, Zhuang X. Advances in Engineering Software, 2018, 122:31-49.",
             "doi": "10.1016/j.advengsoft.2018.05.005",
-            "method": "AT2 phase-field fracture with spectral tensile/compressive split, history field, staggered solve.",
+            "method": "AT2 phase-field fracture with spectral tensile/compressive split, weak-form mechanics, strong-form phase solve.",
         },
         "mesh_source": mesh_source,
         "device": str(device),
@@ -710,6 +944,11 @@ def run(args: argparse.Namespace) -> dict:
             "mesh_resolution_clamped": args.chara_length < args.requested_chara_length,
             "element_type": args.element_type,
             "quadrature_order": args.quadrature_order,
+            "solution_scheme": "mechanics_first_split_with_strong_phase",
+            "mechanics_form": "weak_energy_minimization",
+            "phase_form": "strong_linear_system",
+            "phase_laplacian_scheme": phase_laplacian_scheme,
+            "split_iterations_per_step": args.max_stagger_iters,
             "fix_side_x": args.fix_side_x,
             "loading_steps_requested": len(displacements),
             "loading_steps_run": len(rows),
@@ -721,6 +960,9 @@ def run(args: argparse.Namespace) -> dict:
             "crack_band": args.crack_band,
             "through_tol": args.through_tol,
             "stop_on_through": args.stop_on_through,
+            "save_step_plots": args.save_step_plots,
+            "step_plot_every": args.step_plot_every,
+            "postprocess_every": args.postprocess_every,
         },
         "mesh": {
             "n_points": int(mesh.n_points),
@@ -788,16 +1030,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full", action="store_true", help="Run the paper load schedule up to --final-displacement.")
     parser.add_argument("--final-displacement", type=float, default=5.3e-3)
     parser.add_argument("--uniform-steps", type=int, default=None, help="Use uniformly spaced displacement steps up to --final-displacement.")
-    parser.add_argument("--max-stagger-iters", type=int, default=2)
+    parser.add_argument(
+        "--max-stagger-iters",
+        type=int,
+        default=1,
+        help="Number of mechanics-first split cycles per load step. The default 1 solves mechanics once, then phase once.",
+    )
     parser.add_argument("--u-iters", type=int, default=20)
-    parser.add_argument("--phase-iters", type=int, default=20)
+    parser.add_argument(
+        "--phase-iters",
+        type=int,
+        default=20,
+        help="Deprecated: retained for CLI compatibility. The phase field is solved by a strong-form sparse linear system.",
+    )
     parser.add_argument("--batch-size", type=int, default=-1)
     parser.add_argument("--tolerance", type=float, default=PAPER_NUMERICS["tolerance"])
     parser.add_argument("--free-side-x", action="store_true", help="Do not constrain horizontal displacement on side edges.")
     parser.add_argument("--no-step-plots", action="store_true", help="Do not save one image per loading step.")
-    parser.add_argument("--step-plot-every", type=int, default=1, help="Save one step image every N loading steps.")
+    parser.add_argument("--step-plot-every", type=int, default=5, help="Save one step image every N loading steps.")
+    parser.add_argument(
+        "--postprocess-every",
+        type=int,
+        default=5,
+        help="Compute reaction force and energy every N loading steps. The first, final, and through-crack steps are always sampled.",
+    )
     parser.add_argument("--max-overview-steps", type=int, default=12, help="Maximum number of steps shown in the overview image.")
-    parser.add_argument("--stop-on-through", action="store_true", help="Stop when the monitored crack reaches the right boundary.")
+    parser.add_argument(
+        "--stop-on-through",
+        dest="stop_on_through",
+        action="store_true",
+        default=True,
+        help="Stop when the monitored crack reaches the right boundary. This is enabled by default.",
+    )
+    parser.add_argument(
+        "--continue-after-through",
+        dest="stop_on_through",
+        action="store_false",
+        help="Continue loading after the monitored crack reaches the right boundary.",
+    )
     parser.add_argument("--crack-threshold", type=float, default=0.6, help="Phase-field threshold used to monitor crack advance.")
     parser.add_argument("--crack-band", type=float, default=0.08, help="Half-width around y=0.5 mm used to monitor horizontal crack advance.")
     parser.add_argument("--through-tol", type=float, default=0.04, help="Distance from right edge treated as through-crack.")
@@ -818,7 +1088,9 @@ def parse_args() -> argparse.Namespace:
     args.fix_side_x = not args.free_side_x
     args.save_step_plots = not args.no_step_plots
     args.step_plot_every = max(1, args.step_plot_every)
+    args.postprocess_every = max(1, args.postprocess_every)
     args.max_overview_steps = max(1, args.max_overview_steps)
+    args.max_stagger_iters = max(1, args.max_stagger_iters)
     return args
 
 
